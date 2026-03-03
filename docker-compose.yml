@@ -1,0 +1,30 @@
+---
+services:
+  nextcloud-exporter:
+    build: .
+    image: pva1:5000/nextcloud_exporter
+    container_name: nextcloud-exporter
+    restart: unless-stopped
+    ports:
+      - "9205:9205"
+    environment:
+      - NEXTCLOUD_URL=${NEXTCLOUD_URL}
+      - NEXTCLOUD_AUTH_TOKEN=${NEXTCLOUD_AUTH_TOKEN}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9205/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - monitoring
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  monitoring:
+    driver: bridge
+    name: monitoring
