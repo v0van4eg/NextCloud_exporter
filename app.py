@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация из переменных окружения
 NEXTCLOUD_URL = os.environ.get('NEXTCLOUD_URL', '').rstrip('/')
-NEXTCLOUD_AUTH_TOKEN = os.environ.get('NEXTCLOUD_AUTH_TOKEN', 'clI7dLVJ7y21xgYYlWFchVeODdiGPfSDIp4ROK4F7gCxot2Tfv1lEzihVYocnNc8ujrgUJPw')
+NEXTCLOUD_AUTH_TOKEN = os.environ.get('NEXTCLOUD_AUTH_TOKEN')
 
 # Дополнительные параметры для API запроса
 SKIP_APPS = os.environ.get('SKIP_APPS', 'false').lower() in ('true', '1', 'yes')
