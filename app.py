@@ -3,7 +3,7 @@
 Nextcloud Server Info Exporter for Prometheus
 
 This script fetches server info metrics from a Nextcloud instance and exposes them
-on port 9205 without authentication.
+on port 9206 without authentication.
 """
 
 import os
@@ -13,7 +13,7 @@ import json
 import logging
 from typing import Dict, Any, List, Optional
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 import requests
 
 # Configure logging
@@ -22,7 +22,11 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация из переменных окружения
 NEXTCLOUD_URL = os.environ.get('NEXTCLOUD_URL', '').rstrip('/')
-NEXTCLOUD_AUTH_TOKEN = os.environ.get('NEXTCLOUD_AUTH_TOKEN','')
+NEXTCLOUD_AUTH_TOKEN = os.environ.get('NEXTCLOUD_AUTH_TOKEN', 'clI7dLVJ7y21xgYYlWFchVeODdiGPfSDIp4ROK4F7gCxot2Tfv1lEzihVYocnNc8ujrgUJPw')
+
+# Дополнительные параметры для API запроса
+SKIP_APPS = os.environ.get('SKIP_APPS', 'false').lower() in ('true', '1', 'yes')
+SKIP_UPDATE = os.environ.get('SKIP_UPDATE', 'false').lower() in ('true', '1', 'yes')
 
 if not NEXTCLOUD_URL:
     logger.error("NEXTCLOUD_URL environment variable is not set")
@@ -36,9 +40,11 @@ if not NEXTCLOUD_AUTH_TOKEN:
 class NextcloudMetricsCollector:
     """Collects metrics from Nextcloud server info API."""
 
-    def __init__(self, base_url: str, token: str):
+    def __init__(self, base_url: str, token: str, skip_apps: bool = False, skip_update: bool = False):
         self.base_url = base_url.rstrip('/')
         self.token = token
+        self.skip_apps = skip_apps
+        self.skip_update = skip_update
         self.session = requests.Session()
 
         # Используем специальный заголовок NC-Token как требует Nextcloud
@@ -54,13 +60,19 @@ class NextcloudMetricsCollector:
     def fetch_metrics(self) -> Optional[Dict[str, Any]]:
         """Fetch metrics from Nextcloud API."""
         try:
-            # Используем правильный endpoint из документации
-            params = {'format': 'json'}
+            # Используем правильный endpoint из документации с дополнительными параметрами
+            params = {
+                'format': 'json',
+                'skipApps': str(self.skip_apps).lower(),
+                'skipUpdate': str(self.skip_update).lower()
+            }
+
             endpoint = f"{self.base_url}/ocs/v2.php/apps/serverinfo/api/v1/info"
             url = f"{endpoint}?{urlencode(params)}"
 
             logger.debug(f"Fetching metrics from: {url}")
             logger.debug(f"Using headers: {dict(self.session.headers)}")
+            logger.debug(f"Query params: {params}")
 
             response = self.session.get(url, timeout=30)
 
@@ -194,8 +206,8 @@ class PrometheusFormatter:
 class NextcloudExporter:
     """Main exporter class."""
 
-    def __init__(self, base_url: str, token: str):
-        self.collector = NextcloudMetricsCollector(base_url, token)
+    def __init__(self, base_url: str, token: str, skip_apps: bool = False, skip_update: bool = False):
+        self.collector = NextcloudMetricsCollector(base_url, token, skip_apps, skip_update)
         self.formatter = PrometheusFormatter(prefix="nextcloud")
 
     def collect(self) -> str:
@@ -238,29 +250,25 @@ class NextcloudExporter:
     def _process_metrics(self, data: Dict[str, Any]):
         """Process the metrics data."""
         # Nextcloud system metrics
-        if 'nextcloud' in data and 'system' in data['nextcloud']:
-            system = data['nextcloud']['system']
-            self._process_system_metrics(system)
+        if 'nextcloud' in data:
+            nextcloud_data = data['nextcloud']
 
-        # Storage metrics
-        if 'nextcloud' in data and 'storage' in data['nextcloud']:
-            storage = data['nextcloud']['storage']
-            self._process_storage_metrics(storage)
+            if 'system' in nextcloud_data:
+                self._process_system_metrics(nextcloud_data['system'])
 
-        # Shares metrics
-        if 'nextcloud' in data and 'shares' in data['nextcloud']:
-            shares = data['nextcloud']['shares']
-            self._process_shares_metrics(shares)
+            if 'storage' in nextcloud_data:
+                self._process_storage_metrics(nextcloud_data['storage'])
+
+            if 'shares' in nextcloud_data:
+                self._process_shares_metrics(nextcloud_data['shares'])
 
         # Server metrics
         if 'server' in data:
-            server = data['server']
-            self._process_server_metrics(server)
+            self._process_server_metrics(data['server'])
 
         # Active users metrics
         if 'activeUsers' in data:
-            active_users = data['activeUsers']
-            self._process_active_users_metrics(active_users)
+            self._process_active_users_metrics(data['activeUsers'])
 
     def _process_system_metrics(self, system: Dict[str, Any]):
         """Process system metrics."""
@@ -269,7 +277,7 @@ class NextcloudExporter:
             version = system['version']
             parts = version.split('.')
             self.formatter.add_metric(
-                'info',
+                'system_info',
                 1,
                 {
                     'version': version,
@@ -313,6 +321,10 @@ class NextcloudExporter:
             self.formatter.add_metric('system_free_space_bytes', int(system['freespace']), {}, 'gauge',
                                       'Free disk space in bytes')
 
+        # Theme
+        if 'theme' in system:
+            self.formatter.add_metric('system_theme_info', 1, {'theme': system['theme']}, 'gauge', 'Theme information')
+
         # Feature flags
         feature_flags = [
             ('enable_avatars', 'Avatars enabled'),
@@ -325,6 +337,39 @@ class NextcloudExporter:
             if flag in system:
                 value = 1 if system[flag] in ['yes', 'true', True] else 0
                 self.formatter.add_metric(f'system_{flag}', value, {}, 'gauge', description)
+
+        # Cache backends
+        cache_types = ['memcache.local', 'memcache.distributed', 'memcache.locking']
+        for cache_type in cache_types:
+            if cache_type in system:
+                cache_name = cache_type.replace('.', '_')
+                self.formatter.add_metric(f'system_{cache_name}_info', 1,
+                                          {'backend': system[cache_type]}, 'gauge',
+                                          f'{cache_type} backend')
+
+        # Apps metrics
+        if 'apps' in system:
+            apps = system['apps']
+            if 'num_installed' in apps:
+                self.formatter.add_metric('system_apps_installed_total', int(apps['num_installed']), {}, 'gauge',
+                                          'Total number of installed apps')
+            if 'num_updates_available' in apps:
+                self.formatter.add_metric('system_apps_updates_available_total', int(apps['num_updates_available']),
+                                          {}, 'gauge', 'Number of apps with available updates')
+
+        # Update metrics
+        if 'update' in system:
+            update = system['update']
+            if 'available' in update:
+                self.formatter.add_metric('system_update_available', 1 if update['available'] else 0, {}, 'gauge',
+                                          'Whether an update is available')
+            if 'available_version' in update:
+                self.formatter.add_metric('system_update_available_version', 1,
+                                          {'version': update['available_version']}, 'gauge',
+                                          'Available update version')
+            if 'lastupdatedat' in update:
+                self.formatter.add_metric('system_update_last_checked_timestamp', int(update['lastupdatedat']),
+                                          {}, 'gauge', 'Last update check timestamp')
 
     def _process_storage_metrics(self, storage: Dict[str, Any]):
         """Process storage metrics."""
@@ -365,6 +410,20 @@ class NextcloudExporter:
                 except (ValueError, TypeError):
                     pass
 
+        # Process permissions metrics
+        permissions_metrics = [key for key in shares.keys() if key.startswith('permissions_')]
+        for perm_metric in permissions_metrics:
+            try:
+                # Parse permissions format: permissions_X_Y
+                parts = perm_metric.split('_')
+                if len(parts) >= 3:
+                    perm_type = f"{parts[1]}_{parts[2]}"
+                    self.formatter.add_metric(f'shares_permissions_count', int(shares[perm_metric]),
+                                              {'permission_type': perm_type}, 'gauge',
+                                              f'Number of shares with permission type {perm_type}')
+            except (ValueError, TypeError, IndexError):
+                pass
+
     def _process_server_metrics(self, server: Dict[str, Any]):
         """Process server metrics."""
         # Web server info
@@ -385,26 +444,27 @@ class NextcloudExporter:
                 self.formatter.add_metric('php_info', 1, {'version': php['version']}, 'gauge',
                                           'PHP version information')
 
-            if 'memory_limit' in php:
-                try:
-                    self.formatter.add_metric('php_memory_limit_bytes', int(php['memory_limit']), {}, 'gauge',
-                                              'PHP memory limit in bytes')
-                except (ValueError, TypeError):
-                    pass
+            # PHP settings
+            php_settings = [
+                ('memory_limit', 'php_memory_limit_bytes', 'PHP memory limit in bytes'),
+                ('max_execution_time', 'php_max_execution_time_seconds', 'PHP max execution time in seconds'),
+                ('upload_max_filesize', 'php_upload_max_filesize_bytes', 'PHP upload max filesize in bytes'),
+                ('opcache_revalidate_freq', 'php_opcache_revalidate_freq_seconds', 'OPcache revalidate frequency')
+            ]
 
-            if 'max_execution_time' in php:
-                try:
-                    self.formatter.add_metric('php_max_execution_time_seconds', int(php['max_execution_time']), {},
-                                              'gauge', 'PHP max execution time in seconds')
-                except (ValueError, TypeError):
-                    pass
-
-            if 'upload_max_filesize' in php:
-                try:
-                    self.formatter.add_metric('php_upload_max_filesize_bytes', int(php['upload_max_filesize']), {},
-                                              'gauge', 'PHP upload max filesize in bytes')
-                except (ValueError, TypeError):
-                    pass
+            for setting_key, metric_name, description in php_settings:
+                if setting_key in php:
+                    try:
+                        value = php[setting_key]
+                        if setting_key in ['memory_limit', 'upload_max_filesize']:
+                            # Convert to bytes if needed
+                            if isinstance(value, str) and value.endswith('M'):
+                                value = int(value.rstrip('M')) * 1024 * 1024
+                            elif isinstance(value, str) and value.endswith('G'):
+                                value = int(value.rstrip('G')) * 1024 * 1024 * 1024
+                        self.formatter.add_metric(metric_name, int(value), {}, 'gauge', description)
+                    except (ValueError, TypeError):
+                        pass
 
             # OPcache metrics
             if 'opcache' in php and php['opcache']:
@@ -414,6 +474,7 @@ class NextcloudExporter:
                     self.formatter.add_metric('php_opcache_enabled', 1 if opcache['opcache_enabled'] else 0, {},
                                               'gauge', 'OPcache enabled')
 
+                # Memory usage
                 if 'memory_usage' in opcache:
                     memory = opcache['memory_usage']
                     if 'used_memory' in memory:
@@ -425,21 +486,110 @@ class NextcloudExporter:
                     if 'wasted_memory' in memory:
                         self.formatter.add_metric('php_opcache_memory_wasted_bytes', int(memory['wasted_memory']), {},
                                                   'gauge', 'OPcache wasted memory in bytes')
+                    if 'current_wasted_percentage' in memory:
+                        self.formatter.add_metric('php_opcache_memory_wasted_percent',
+                                                  float(memory['current_wasted_percentage']), {},
+                                                  'gauge', 'OPcache wasted memory percentage')
 
+                # Statistics
                 if 'opcache_statistics' in opcache:
                     stats = opcache['opcache_statistics']
-                    if 'hits' in stats:
-                        self.formatter.add_metric('php_opcache_hits_total', int(stats['hits']), {}, 'counter',
-                                                  'OPcache hits total')
-                    if 'misses' in stats:
-                        self.formatter.add_metric('php_opcache_misses_total', int(stats['misses']), {}, 'counter',
-                                                  'OPcache misses total')
-                    if 'opcache_hit_rate' in stats:
-                        self.formatter.add_metric('php_opcache_hit_rate_percent', float(stats['opcache_hit_rate']), {},
-                                                  'gauge', 'OPcache hit rate percentage')
-                    if 'num_cached_scripts' in stats:
-                        self.formatter.add_metric('php_opcache_cached_scripts_count', int(stats['num_cached_scripts']),
-                                                  {}, 'gauge', 'OPcache cached scripts count')
+                    stat_mappings = [
+                        ('hits', 'php_opcache_hits_total', 'counter', 'OPcache hits total'),
+                        ('misses', 'php_opcache_misses_total', 'counter', 'OPcache misses total'),
+                        ('opcache_hit_rate', 'php_opcache_hit_rate_percent', 'gauge', 'OPcache hit rate percentage'),
+                        ('num_cached_scripts', 'php_opcache_cached_scripts_count', 'gauge',
+                         'OPcache cached scripts count'),
+                        ('num_cached_keys', 'php_opcache_cached_keys_count', 'gauge', 'OPcache cached keys count'),
+                        ('max_cached_keys', 'php_opcache_max_cached_keys', 'gauge', 'OPcache max cached keys'),
+                        ('start_time', 'php_opcache_start_time_seconds', 'gauge', 'OPcache start timestamp'),
+                        ('last_restart_time', 'php_opcache_last_restart_time_seconds', 'gauge',
+                         'OPcache last restart timestamp'),
+                        ('oom_restarts', 'php_opcache_oom_restarts_total', 'counter', 'OPcache out of memory restarts'),
+                        ('hash_restarts', 'php_opcache_hash_restarts_total', 'counter', 'OPcache hash restarts'),
+                        ('manual_restarts', 'php_opcache_manual_restarts_total', 'counter', 'OPcache manual restarts'),
+                        ('blacklist_misses', 'php_opcache_blacklist_misses_total', 'counter',
+                         'OPcache blacklist misses')
+                    ]
+
+                    for stat_key, metric_name, metric_type, description in stat_mappings:
+                        if stat_key in stats:
+                            try:
+                                value = stats[stat_key]
+                                if stat_key in ['opcache_hit_rate']:
+                                    value = float(value)
+                                else:
+                                    value = int(value)
+                                self.formatter.add_metric(metric_name, value, {}, metric_type, description)
+                            except (ValueError, TypeError):
+                                pass
+
+                # JIT metrics
+                if 'jit' in opcache:
+                    jit = opcache['jit']
+                    jit_metrics = [
+                        ('enabled', 'php_opcache_jit_enabled', 'gauge', 'JIT enabled'),
+                        ('on', 'php_opcache_jit_on', 'gauge', 'JIT on'),
+                        ('kind', 'php_opcache_jit_kind', 'gauge', 'JIT kind'),
+                        ('opt_level', 'php_opcache_jit_opt_level', 'gauge', 'JIT optimization level'),
+                        ('opt_flags', 'php_opcache_jit_opt_flags', 'gauge', 'JIT optimization flags'),
+                        ('buffer_size', 'php_opcache_jit_buffer_size_bytes', 'gauge', 'JIT buffer size'),
+                        ('buffer_free', 'php_opcache_jit_buffer_free_bytes', 'gauge', 'JIT free buffer size')
+                    ]
+
+                    for jit_key, metric_name, metric_type, description in jit_metrics:
+                        if jit_key in jit:
+                            try:
+                                value = jit[jit_key]
+                                if isinstance(value, bool):
+                                    value = 1 if value else 0
+                                self.formatter.add_metric(metric_name, int(value), {}, metric_type, description)
+                            except (ValueError, TypeError):
+                                pass
+
+            # APCu metrics
+            if 'apcu' in php:
+                apcu = php['apcu']
+
+                if 'cache' in apcu:
+                    cache = apcu['cache']
+                    cache_metrics = [
+                        ('num_slots', 'php_apcu_num_slots', 'gauge', 'APCu number of slots'),
+                        ('ttl', 'php_apcu_ttl_seconds', 'gauge', 'APCu TTL'),
+                        ('num_hits', 'php_apcu_hits_total', 'counter', 'APCu hits total'),
+                        ('num_misses', 'php_apcu_misses_total', 'counter', 'APCu misses total'),
+                        ('num_inserts', 'php_apcu_inserts_total', 'counter', 'APCu inserts total'),
+                        ('num_entries', 'php_apcu_entries_total', 'gauge', 'APCu number of entries'),
+                        ('cleanups', 'php_apcu_cleanups_total', 'counter', 'APCu cleanups total'),
+                        ('defragmentations', 'php_apcu_defragmentations_total', 'counter',
+                         'APCu defragmentations total'),
+                        ('expunges', 'php_apcu_expunges_total', 'counter', 'APCu expunges total'),
+                        ('start_time', 'php_apcu_start_time_seconds', 'gauge', 'APCu start timestamp'),
+                        ('mem_size', 'php_apcu_memory_size_bytes', 'gauge', 'APCu memory size')
+                    ]
+
+                    for cache_key, metric_name, metric_type, description in cache_metrics:
+                        if cache_key in cache:
+                            try:
+                                self.formatter.add_metric(metric_name, int(cache[cache_key]), {}, metric_type,
+                                                          description)
+                            except (ValueError, TypeError):
+                                pass
+
+                if 'sma' in apcu:
+                    sma = apcu['sma']
+                    sma_metrics = [
+                        ('num_seg', 'php_apcu_sma_num_segments', 'gauge', 'APCu SMA number of segments'),
+                        ('seg_size', 'php_apcu_sma_segment_size_bytes', 'gauge', 'APCu SMA segment size'),
+                        ('avail_mem', 'php_apcu_sma_available_memory_bytes', 'gauge', 'APCu SMA available memory')
+                    ]
+
+                    for sma_key, metric_name, metric_type, description in sma_metrics:
+                        if sma_key in sma:
+                            try:
+                                self.formatter.add_metric(metric_name, int(sma[sma_key]), {}, metric_type, description)
+                            except (ValueError, TypeError):
+                                pass
 
         # Database metrics
         if 'database' in server:
@@ -459,7 +609,11 @@ class NextcloudExporter:
 
             if 'size' in db:
                 try:
-                    self.formatter.add_metric('database_size_bytes', int(db['size']), {}, 'gauge',
+                    # Convert to bytes if needed
+                    size = db['size']
+                    if isinstance(size, str) and size.isdigit():
+                        size = int(size)
+                    self.formatter.add_metric('database_size_bytes', int(size), {}, 'gauge',
                                               'Database size in bytes')
                 except (ValueError, TypeError):
                     pass
@@ -467,21 +621,22 @@ class NextcloudExporter:
     def _process_active_users_metrics(self, active_users: Dict[str, Any]):
         """Process active users metrics."""
         active_metrics = [
-            ('last5minutes', 'Active users in last 5 minutes'),
-            ('last1hour', 'Active users in last hour'),
-            ('last24hours', 'Active users in last 24 hours'),
-            ('last7days', 'Active users in last 7 days'),
-            ('last1month', 'Active users in last month'),
-            ('last3months', 'Active users in last 3 months'),
-            ('last6months', 'Active users in last 6 months'),
-            ('lastyear', 'Active users in last year')
+            ('last5minutes', '5m'),
+            ('last1hour', '1h'),
+            ('last24hours', '24h'),
+            ('last7days', '7d'),
+            ('last1month', '1M'),
+            ('last3months', '3M'),
+            ('last6months', '6M'),
+            ('lastyear', '1y')
         ]
 
-        for metric, description in active_metrics:
-            if metric in active_users:
+        for metric_key, time_range in active_metrics:
+            if metric_key in active_users:
                 try:
-                    self.formatter.add_metric(f'active_users_{metric}', int(active_users[metric]), {}, 'gauge',
-                                              description)
+                    value = int(active_users[metric_key])
+                    self.formatter.add_metric('active_users_count', value, {'time_range': time_range}, 'gauge',
+                                              f'Active users in last {time_range}')
                 except (ValueError, TypeError):
                     pass
 
@@ -491,7 +646,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         """Handle GET requests."""
-        if self.path == '/metrics':
+        if self.path == '/metrics' or self.path.startswith('/metrics?'):
             self.handle_metrics_request()
         elif self.path == '/health':
             self.send_response(200)
@@ -516,9 +671,23 @@ class MetricsHandler(BaseHTTPRequestHandler):
     def handle_metrics_request(self):
         """Handle metrics request."""
         try:
+            # Получаем значения из глобальных переменных
+            skip_apps = SKIP_APPS
+            skip_update = SKIP_UPDATE
+
+            # Проверяем наличие параметров в query string
+            query_components = parse_qs(urlparse(self.path).query)
+
+            if 'skip_apps' in query_components:
+                skip_apps = query_components['skip_apps'][0].lower() in ('true', '1', 'yes')
+            if 'skip_update' in query_components:
+                skip_update = query_components['skip_update'][0].lower() in ('true', '1', 'yes')
+
             exporter = NextcloudExporter(
                 NEXTCLOUD_URL,
-                NEXTCLOUD_AUTH_TOKEN
+                NEXTCLOUD_AUTH_TOKEN,
+                skip_apps,
+                skip_update
             )
             metrics = exporter.collect()
 
@@ -546,15 +715,30 @@ def main():
     parser.add_argument('--scrape-once', action='store_true', help='Scrape once and exit')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
 
+    # Добавляем аргументы для параметров API
+    parser.add_argument('--skip-apps', action='store_true',
+                        help='Skip apps information in response (default: false)')
+    parser.add_argument('--skip-update', action='store_true',
+                        help='Skip update information in response (default: false)')
+
     args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # Обновляем глобальные переменные на основе аргументов командной строки
+    global SKIP_APPS, SKIP_UPDATE
+    if args.skip_apps:
+        SKIP_APPS = True
+    if args.skip_update:
+        SKIP_UPDATE = True
+
     if args.scrape_once:
         exporter = NextcloudExporter(
             NEXTCLOUD_URL,
-            NEXTCLOUD_AUTH_TOKEN
+            NEXTCLOUD_AUTH_TOKEN,
+            SKIP_APPS,
+            SKIP_UPDATE
         )
         metrics = exporter.collect()
         print(metrics)
@@ -564,6 +748,7 @@ def main():
     logger.info(f"Starting Nextcloud Exporter on {args.host}:{args.port}")
     logger.info(f"Metrics endpoint: http://{args.host}:{args.port}/metrics")
     logger.info(f"Nextcloud URL: {NEXTCLOUD_URL}")
+    logger.info(f"API params: skipApps={SKIP_APPS}, skipUpdate={SKIP_UPDATE}")
     logger.info("Authentication: NC-Token header")
 
     try:

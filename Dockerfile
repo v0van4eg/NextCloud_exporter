@@ -25,8 +25,8 @@ RUN pip install --no-cache-dir requests && \
 USER nextcloud-exporter
 
 # Открываем порт для метрик
-EXPOSE 9205
+EXPOSE 9206
 
 # Запускаем приложение
 ENTRYPOINT ["python", "/app/app.py"]
-CMD ["--host", "0.0.0.0", "--port", "9205"]
+CMD ["--host", "0.0.0.0", "--port", "9206"]

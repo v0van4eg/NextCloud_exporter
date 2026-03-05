@@ -4,14 +4,17 @@ services:
     build: .
     image: pva1:5000/nextcloud_exporter
     container_name: nextcloud-exporter
+    hostname: sv-cloud
     restart: unless-stopped
+    env_file:
+      - ./.env
     ports:
-      - "9205:9205"
+      - "9206:9206"
     environment:
-      - NEXTCLOUD_URL=${NEXTCLOUD_URL}
-      - NEXTCLOUD_AUTH_TOKEN=${NEXTCLOUD_AUTH_TOKEN}
+      - NEXTCLOUD_URL
+      - NEXTCLOUD_AUTH_TOKEN=clI7dLVJ7y21xgYYlWFchVeODdiGPfSDIp4ROK4F7gCxot2Tfv1lEzihVYocnNc8ujrgUJPw
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9205/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:9206/health"]
       interval: 30s
       timeout: 10s
       retries: 3
