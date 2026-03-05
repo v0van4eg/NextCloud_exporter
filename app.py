@@ -406,7 +406,16 @@ class NextcloudExporter:
         for metric, description in shares_metrics:
             if metric in shares:
                 try:
-                    self.formatter.add_metric(f'shares_{metric}', int(shares[metric]), {}, 'gauge', description)
+                    if metric == 'num_shares':
+                        # Total shares metric remains as is
+                        self.formatter.add_metric(f'shares_{metric}', int(shares[metric]), {}, 'gauge', description)
+                    elif metric.startswith('num_shares_'):
+                        # For specific share types, use a single metric name with type label
+                        share_type = metric.replace('num_shares_', '')
+                        self.formatter.add_metric('shares_num_shares', int(shares[metric]), {'type': share_type}, 'gauge', description)
+                    else:
+                        # For other metrics like fed shares, keep as is
+                        self.formatter.add_metric(f'shares_{metric}', int(shares[metric]), {}, 'gauge', description)
                 except (ValueError, TypeError):
                     pass
 
